@@ -2,12 +2,20 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
+> [!NOTE]
+> **This is a fork.** The `hub` branch tracks
+> [`Neroued/ninfer`](https://github.com/Neroued/ninfer) and adds two
+> all-linear-NVFP4 weights profiles for Qwen3.8-27B that upstream does not
+> carry. Everything else is upstream's work. See
+> [Fork additions](#fork-additions).
+
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
 OpenAI-/Anthropic-compatible HTTP APIs. The runtime is deliberately specialized: one GPU, one
 resident model, and a startup-fixed capacity of one to eight active requests.
 
-NInfer supports five artifact identities. The quick-start commands use Qwen3.8-27B NVFP4.
+NInfer supports five artifact identities upstream, and seven on this branch. The quick-start
+commands use Qwen3.8-27B NVFP4.
 
 | Model | Weights | Artifact | Download and model card |
 |---|---|---|---|
@@ -16,9 +24,64 @@ NInfer supports five artifact identities. The quick-start commands use Qwen3.8-2
 | Qwen3.8-27B | `groupwise-int` | `qwen3_8_27b.ninfer` | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) |
 | Qwen3.8-27B | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) |
 | Qwen3.6-35B-A3B | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
+| Qwen3.8-27B | `nvfp4-quasar` **(fork)** | `qwen3_8_27b_nvfp4_quasar.ninfer` | [QUASAR-NVFP4](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer) — needs retagging, see below |
+| Qwen3.8-27B | `nvfp4full` **(fork)** | `qwen3_8_27b_nvfp4full.ninfer` | [nvfp4full](https://huggingface.co/cometkim/Qwen3.8-27B-nvfp4full-NInfer) |
 
 The artifact identity fixes the exact model and weight profile. Every artifact also embeds the
 tokenizer, chat template, and media frontend resources required by its registered target.
+
+## Fork additions
+
+Upstream's `qwen3.8-27b/nvfp4` profile is bound to the mixed tiering of
+`unsloth/Qwen3.8-27B-NVFP4`: FP8 at attention, the GDN projections, `lm_head` and the last eight
+MLP layers, NVFP4 only at the rest. Two all-linear-NVFP4 sources exist that it cannot describe, and
+both are materially lighter. This branch registers each under its own `weights_id`:
+
+| `weights_id` | Source | Resident weights |
+|---|---|---|
+| `nvfp4` (upstream) | `unsloth/Qwen3.8-27B-NVFP4`, mixed FP8/NVFP4 | 19.7 GiB |
+| `nvfp4-quasar` | `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4`, QAT over every linear | **16.1 GiB** |
+| `nvfp4full` | a fuller re-conversion of the same unsloth source, by cometkim | 16.8 GiB |
+
+On a 32 GiB card that is the difference between 192k and the model's full 262,144 context with the
+Vision weights resident. Measured on one RTX 5090, one binary, one thermal window, so the artifact
+is the only variable:
+
+| | `nvfp4` | `nvfp4-quasar` | `nvfp4full` |
+|---|---:|---:|---:|
+| Free VRAM at 262,144 + Vision, NVFP4 KV | 3.44 GiB | **7.07 GiB** | 6.39 GiB |
+| Prefill, 42,877-token prompt, cold | 6,130 tok/s | **8,030 tok/s** | 7,490 tok/s |
+| Six graded tasks x two seeds | 11/12 | 12/12 | 12/12 |
+
+Read the quality column as a tie: twelve checks cannot separate 12/12 from 12/12.
+
+**Why a name and not a sniff.** Each source gets its own `weights_id` so that `resolve_weights()`
+stays a total function of the identity it is handed. Telling three artifacts apart by inspecting
+their stored tensor formats would make the identity a hint rather than a contract, and would have to
+be re-derived against every profile already registered each time a source was added.
+
+**No new numerics.** At all seven workspace sites where `Qwen38Nvfp4` selects FP8 with
+`kFp8TextPolicy`, the sibling `Qwen36Nvfp4` already selects NVFP4 with `kNvfp4TextPolicy` at
+identical extents, and `FusedGdnControlProjectionPlan` already exists. No new QType, kernel, policy
+or workspace computation is introduced. The change is 147 lines across five files.
+
+**Getting the QUASAR artifact.** It is published claiming `qwen3.8-27b/nvfp4` — the same identity as
+the official artifact — so it must be retagged before this branch will load it. The container is
+`magic(8) | json_bytes(8) | JSON | pad to 4096 | payload` and object offsets are relative to
+`payload_start`, so growing `weights_id` by seven bytes fits inside the existing alignment padding
+and moves no payload byte:
+
+```bash
+python3 tools/artifact/retag_weights_id.py qwen3_8_27b_nvfp4_quasar.ninfer nvfp4-quasar
+```
+
+It refuses to run if the payload would move. `nvfp4full` is published under its own identity and
+needs nothing.
+
+**Upstream status.** [ninfer#70](https://github.com/Neroued/ninfer/issues/70) asked for the same
+shape of change and was closed `NOT_PLANNED`, so this is a standing divergence rather than a patch
+waiting to land. The branch merges `upstream/master` rather than rebasing, and carries no changes
+outside the files listed above.
 
 ## Quick start
 
