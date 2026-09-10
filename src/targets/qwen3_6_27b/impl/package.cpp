@@ -95,6 +95,18 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
     }
+    // A distinct weights_id rather than a second reading of "nvfp4". The QUASAR checkpoint
+    // quantizes every linear, so its stored formats differ from the mixed FP8/NVFP4 artifact
+    // at nearly every endpoint; sniffing the payload to tell them apart would make the
+    // identity a hint rather than a contract, and would have to be re-derived for each
+    // further source. Registering the name keeps resolve_weights a total function of the
+    // identity it is given.
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4-quasar") {
+        return WeightsProfile::Qwen38Nvfp4Quasar;
+    }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4full") {
+        return WeightsProfile::Qwen38Nvfp4Full;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
