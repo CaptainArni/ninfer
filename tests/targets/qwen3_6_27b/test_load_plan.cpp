@@ -329,6 +329,73 @@ int verify_vision_workspace_planning() {
 
 } // namespace
 
+// QUASAR is quantization-aware training over every Text linear, so the exact inventory is the
+// contract: all 256 matrices NVFP4, none of Qwen3.6's BF16 exceptions, and the GDN control pair
+// fused. A source that silently regained a BF16 matrix would still bind, so count rather than
+// spot-check.
+int verify_quasar_nvfp4(const std::filesystem::path& path) {
+    ninfer::artifact::Reader reader(path);
+    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen38Nvfp4Quasar) {
+        std::cerr << "QUASAR identity resolved to the wrong profile\n";
+        return 1;
+    }
+    ninfer::artifact::Binder binder(reader);
+    const ArtifactLoadPlan plan =
+        bind_artifact(binder, WeightsProfile::Qwen38Nvfp4Quasar, all_features());
+    if (plan.bindings.token_embedding.format != NumericFormat::W8G32_F16S ||
+        plan.bindings.output_head.format != NumericFormat::W8G32_F16S) {
+        std::cerr << "QUASAR vocabulary endpoints have the wrong storage profile\n";
+        return 1;
+    }
+
+    std::size_t nvfp4_weights   = 0;
+    std::size_t fused_controls  = 0;
+    const auto count_weight     = [&](const WeightPlan& weight) {
+        if (weight.format != NumericFormat::NVFP4) { return false; }
+        ++nvfp4_weights;
+        return valid_divisors(weight);
+    };
+    for (const TextLayerPlan& layer : plan.bindings.text_layers) {
+        if (!count_weight(layer.mlp.gate_up) || !count_weight(layer.mlp.down)) {
+            std::cerr << "QUASAR MLP is not NVFP4 with valid divisors\n";
+            return 1;
+        }
+        if (layer.is_full_attention) {
+            const auto* fused =
+                std::get_if<FusedAttentionProjectionPlan>(&layer.attention.projection);
+            if (fused == nullptr || !count_weight(fused->query_key_gate_value) ||
+                !count_weight(layer.attention.output)) {
+                std::cerr << "QUASAR attention is not NVFP4 with valid divisors\n";
+                return 1;
+            }
+        } else {
+            const auto* fused =
+                std::get_if<FusedGdnInputProjectionPlan>(&layer.gdn.input_projection);
+            if (fused == nullptr || !count_weight(fused->query_key_value_z) ||
+                !count_weight(layer.gdn.output)) {
+                std::cerr << "QUASAR GDN is not NVFP4 with valid divisors\n";
+                return 1;
+            }
+            // The 48-row control halves are outside the registered NVFP4 execution geometry, so
+            // they stay BF16 and arrive fused as one [96, 5120] parent.
+            const auto* control =
+                std::get_if<FusedGdnControlProjectionPlan>(&layer.gdn.control_projection);
+            if (control == nullptr ||
+                control->a_b_projection.format != NumericFormat::BF16) {
+                std::cerr << "QUASAR GDN control projection is not a fused BF16 parent\n";
+                return 1;
+            }
+            ++fused_controls;
+        }
+    }
+    if (nvfp4_weights != 256 || fused_controls != 48) {
+        std::cerr << "QUASAR Text inventory has the wrong storage profile: nvfp4=" << nvfp4_weights
+                  << " fused_control=" << fused_controls << " expected nvfp4=256 fused_control=48\n";
+        return 1;
+    }
+    return 0;
+}
+
 int main() {
     const std::filesystem::path groupwise =
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
@@ -342,6 +409,13 @@ int main() {
         artifact_path("NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS", "qwen3_8_27b.ninfer");
     const std::filesystem::path qwen38_nvfp4_dflash2 = artifact_path(
         "NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS", "qwen3_8_27b_nvfp4.ninfer");
+    const std::filesystem::path qwen38_nvfp4_quasar = artifact_path(
+        "NINFER_QWEN3_8_27B_NVFP4_QUASAR_WEIGHTS", "qwen3_8_27b_nvfp4_quasar.ninfer");
+    if (std::filesystem::is_regular_file(qwen38_nvfp4_quasar)) {
+        if (const int result = verify_quasar_nvfp4(qwen38_nvfp4_quasar); result != 0) {
+            return result;
+        }
+    }
     if (!std::filesystem::is_regular_file(groupwise) || !std::filesystem::is_regular_file(nvfp4)) {
         std::cerr << "skip: both real 27B artifacts are required: groupwise=" << groupwise
                   << " nvfp4=" << nvfp4 << '\n';
